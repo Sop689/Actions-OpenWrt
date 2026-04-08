@@ -1,0 +1,102 @@
+name: Build LEDE Firmware
+
+# 触发条件：可以根据需要调整
+on:
+  workflow_dispatch:        # 允许手动触发
+  push:
+    branches: [ master ]     # 当 master 分支有推送时触发
+  # schedule:
+  #   - cron: '0 0 * * 0'   # 可选：每周日 00:00 UTC 自动构建
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 400     # 编译超时时间，可根据需要调整
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # 核心：缓存大文件目录，这是二次编译加速的关键
+    - name: Cache OpenWrt
+      uses: actions/cache@v4
+      id: cache_openwrt
+      with:
+        path: |
+          openwrt/dl          # 存放下载的软件包源码
+          openwrt/build_dir   # 编译过程中的临时文件
+          openwrt/staging_dir # 编译工具链和中间文件
+          openwrt/tmp         # 编译临时文件
+        # 使用包含关键配置文件的哈希值作为缓存键，当配置变更时缓存会失效
+        key: ${{ runner.os }}-lede-${{ hashFiles('openwrt/.config', 'openwrt/feeds.conf.default') }}
+        restore-keys: |
+          ${{ runner.os }}-lede-
+
+    - name: Clone LEDE Source
+      run: |
+        git clone https://github.com/coolsnowwolf/lede.git openwrt
+        cd openwrt
+        # 如果你的二次编译基于特定分支或提交，可以在这里切换
+        # git checkout your-branch
+
+    - name: Update & Install Feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    # 关键步骤：放置你的 .config 配置文件
+    - name: Copy Config File
+      run: |
+        # 方案一：如果你的 .config 文件在仓库根目录，使用此行
+        cp .config openwrt/.config
+        # 方案二：如果你想直接在流程中通过脚本生成 .config，请参考下一段“高级配置”
+
+    # 高级配置：如需在流程中直接调整，可在此修改 .config 文件
+    - name: Modify Config (Optional)
+      run: |
+        cd openwrt
+        
+        # 1. 设置根文件系统分区大小为 2048 MB (根据你的需求修改)
+        sed -i 's/CONFIG_TARGET_ROOTFS_PARTSIZE=.*/CONFIG_TARGET_ROOTFS_PARTSIZE=2048/g' .config
+        
+        # 2. 如果你需要生成 squashfs 格式的固件，确保以下选项已启用
+        #    这些是 x86 64位架构的典型设置，请根据你的目标设备调整
+        sed -i 's/CONFIG_TARGET_IMAGES_GZIP=.*/CONFIG_TARGET_IMAGES_GZIP=y/g' .config
+        sed -i 's/CONFIG_TARGET_ROOTFS_SQUASHFS=.*/CONFIG_TARGET_ROOTFS_SQUASHFS=y/g' .config
+        sed -i 's/CONFIG_GRUB_IMAGES=.*/CONFIG_GRUB_IMAGES=y/g' .config
+        
+        # 可选：如果不需要 ext4 格式的根文件系统，可以禁用以减小体积
+        # sed -i 's/CONFIG_TARGET_ROOTFS_EXT4FS=.*/# CONFIG_TARGET_ROOTFS_EXT4FS is not set/g' .config
+        
+        # 更新配置文件依赖
+        make defconfig
+
+    - name: Download Packages
+      run: |
+        cd openwrt
+        make download -j$(nproc)
+
+    - name: Build Firmware
+      run: |
+        cd openwrt
+        # -j$(nproc) 使用所有CPU核心并行编译，加快速度
+        # V=s 输出详细日志，便于调试
+        make -j$(nproc) V=s
+
+    # 上传构建产物（中间文件，便于调试）
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: lede-build-files
+        path: |
+          openwrt/bin/targets/
+
+    # 发布最终固件到 GitHub Release
+    - name: Release Firmware
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')  # 仅在创建新标签时触发
+      with:
+        files: openwrt/bin/targets/**/*generic-squashfs-combined*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
